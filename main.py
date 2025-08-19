@@ -1,4 +1,17 @@
-from f
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+from config import settings
+# Extra imports for AI routes
+from pydantic import BaseModel
+import httpx
+import os
+import logging
+import asyncio
+from typing import Optional, List, Dict, Any
+# Keep geospatial imports for potential future use
+import geopandas as gpd
+import pandas as pd
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
