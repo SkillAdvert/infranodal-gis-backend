@@ -9,8 +9,7 @@ import os
 import logging
 import asyncio
 from typing import Optional
-import psycopg2
-import psycopg2.extras
+import asyncpg  # Using asyncpg for better Supabase pooling support
 from typing import List, Dict, Any
 
 # Set up logging
@@ -57,6 +56,24 @@ async def environment_check():
         "environment_variables": env_vars,
         "all_present": all(var == "✅" for var in env_vars.values())
     }
+
+# ==============================
+# Database Connection Helper
+# ==============================
+
+async def get_db_connection():
+    """Create a new database connection for each request (works with Supabase pooling)"""
+    try:
+        return await asyncpg.connect(
+            settings.DATABASE_URL,
+            server_settings={
+                'application_name': 'infranodal_api',
+                'client_encoding': 'utf8'
+            }
+        )
+    except Exception as e:
+        logger.error(f"Database connection failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Database connection failed: {str(e)}")
 
 # ==============================
 # AI Proxy Routes
@@ -279,7 +296,7 @@ async def debug_perplexity():
     }
 
 # ==============================
-# Renewable Sites API Routes (FIXED FOR SUPABASE POOLING)
+# Renewable Sites API Routes (USING ASYNCPG)
 # ==============================
 
 @app.get("/api/sites")
@@ -287,25 +304,12 @@ async def get_renewable_sites():
     """Get all renewable energy sites as GeoJSON for map display"""
     
     conn = None
-    cur = None
     try:
-        # Connect to Supabase database with specific connection settings for pooling
-        conn = psycopg2.connect(
-            settings.DATABASE_URL,
-            # These settings help with pooled connections
-            application_name='infranodal_api',
-            client_encoding='utf8',
-            # Don't use server-side prepared statements (can cause issues with pooling)
-            options='-c default_transaction_isolation=read_committed'
-        )
-        
-        # Set autocommit to avoid transaction issues with pooling
-        conn.autocommit = True
-        
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        # Connect to Supabase database using asyncpg
+        conn = await get_db_connection()
         
         # Get all sites
-        cur.execute("""
+        query = """
             SELECT 
                 id,
                 site_name,
@@ -317,9 +321,9 @@ async def get_renewable_sites():
                 status
             FROM renewable_sites 
             ORDER BY capacity_mw DESC
-        """)
+        """
         
-        sites = cur.fetchall()
+        rows = await conn.fetch(query)
         
         # Convert to GeoJSON format for map display
         geojson = {
@@ -327,20 +331,20 @@ async def get_renewable_sites():
             "features": []
         }
         
-        for site in sites:
+        for row in rows:
             feature = {
                 "type": "Feature",
                 "geometry": {
                     "type": "Point",
-                    "coordinates": [float(site['longitude']), float(site['latitude'])]
+                    "coordinates": [float(row['longitude']), float(row['latitude'])]
                 },
                 "properties": {
-                    "id": site['id'],
-                    "name": site['site_name'],
-                    "developer": site['developer'],
-                    "technology": site['technology'],
-                    "capacity_mw": float(site['capacity_mw']),
-                    "status": site['status']
+                    "id": row['id'],
+                    "name": row['site_name'],
+                    "developer": row['developer'],
+                    "technology": row['technology'],
+                    "capacity_mw": float(row['capacity_mw']),
+                    "status": row['status']
                 }
             }
             geojson["features"].append(feature)
@@ -352,30 +356,22 @@ async def get_renewable_sites():
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
     
     finally:
-        if cur:
-            cur.close()
         if conn:
-            conn.close()
+            await conn.close()
 
 @app.get("/api/sites/simple")
 async def get_sites_simple():
     """Get renewable sites as simple JSON (for testing)"""
     
     conn = None
-    cur = None
     try:
-        conn = psycopg2.connect(
-            settings.DATABASE_URL,
-            application_name='infranodal_api',
-            client_encoding='utf8',
-            options='-c default_transaction_isolation=read_committed'
-        )
-        conn.autocommit = True
+        conn = await get_db_connection()
         
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        query = "SELECT * FROM renewable_sites ORDER BY capacity_mw DESC"
+        rows = await conn.fetch(query)
         
-        cur.execute("SELECT * FROM renewable_sites ORDER BY capacity_mw DESC")
-        sites = cur.fetchall()
+        # Convert asyncpg.Record objects to dictionaries
+        sites = [dict(row) for row in rows]
         
         return {"sites": sites, "count": len(sites)}
         
@@ -384,29 +380,18 @@ async def get_sites_simple():
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
     
     finally:
-        if cur:
-            cur.close()
         if conn:
-            conn.close()
+            await conn.close()
 
 @app.get("/api/test-db")
 async def test_database_connection():
     """Test the database connection"""
     conn = None
-    cur = None
     try:
-        conn = psycopg2.connect(
-            settings.DATABASE_URL,
-            application_name='infranodal_api',
-            client_encoding='utf8',
-            options='-c default_transaction_isolation=read_committed'
-        )
-        conn.autocommit = True
-        cur = conn.cursor()
+        conn = await get_db_connection()
         
         # Simple test query
-        cur.execute("SELECT 1")
-        result = cur.fetchone()[0]
+        result = await conn.fetchval("SELECT 1")
         
         return {
             "status": "success", 
@@ -424,10 +409,8 @@ async def test_database_connection():
         }
     
     finally:
-        if cur:
-            cur.close()
         if conn:
-            conn.close()
+            await conn.close()
 
 # ==============================
 # Run app (only in local dev)
