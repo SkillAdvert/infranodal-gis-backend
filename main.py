@@ -1,348 +1,151 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
-from config import settings
-# Extra imports for AI routes
+# ADD THESE IMPORTS to your existing imports section
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from pydantic import BaseModel
-import httpx
-import os
-import logging
-import asyncio
-from typing import Optional, List, Dict, Any
-# Keep geospatial imports for potential future use
-import geopandas as gpd
 import pandas as pd
+import io
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# ADD THESE MODELS after your existing ChatRequest/ChatResponse models
+class ScoringConfig(BaseModel):
+    capacity_weight: float = 0.3
+    grid_proximity_weight: float = 0.25
+    planning_risk_weight: float = 0.2
+    market_demand_weight: float = 0.15
+    competition_weight: float = 0.1
 
-app = FastAPI(
-    title=settings.APP_NAME,
-    version=settings.VERSION,
-    description="Geospatial data platform with persona-based layers"
-)
+# GLOBAL VARIABLE - add after your existing global variables
+current_scoring_config = ScoringConfig()
 
-# CORS middleware (allows frontend to call backend)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],   # for demo, allow all; later restrict to your frontend URL
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-@app.get("/")
-async def root():
-    return {
-        "message": f"Welcome to {settings.APP_NAME}",
-        "version": settings.VERSION,
-        "status": "running"
-    }
-
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy"}
-
-@app.get("/health/env")
-async def environment_check():
-    """Check if required environment variables are set"""
-    env_vars = {
-        "OPENAI_API_KEY": "✅" if os.getenv("OPENAI_API_KEY") else "❌",
-        "PERPLEXITY_API_KEY": "✅" if os.getenv("PERPLEXITY_API_KEY") else "❌",
-        "SUPABASE_URL": "✅" if os.getenv("SUPABASE_URL") else "❌",
-        "SUPABASE_ANON_KEY": "✅" if os.getenv("SUPABASE_ANON_KEY") else "❌",
-        # Keep DATABASE_URL check for backwards compatibility
-        "DATABASE_URL": "✅" if os.getenv("DATABASE_URL") else "❌",
-    }
+# ADD THIS CLASS after your existing classes
+class SiteScorer:
+    def __init__(self, config: ScoringConfig):
+        self.config = config
     
-    return {
-        "environment_variables": env_vars,
-        "supabase_configured": env_vars["SUPABASE_URL"] == "✅" and env_vars["SUPABASE_ANON_KEY"] == "✅",
-        "ai_configured": env_vars["OPENAI_API_KEY"] == "✅" and env_vars["PERPLEXITY_API_KEY"] == "✅"
-    }
-
-# ==============================
-# Supabase Configuration
-# ==============================
-
-# Supabase settings
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
-
-async def get_supabase_data(table: str, select: str = "*", filters: Optional[Dict[str, Any]] = None) -> List[Dict[Any, Any]]:
-    """Fetch data from Supabase REST API"""
-    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
-        raise HTTPException(status_code=500, detail="Supabase configuration missing - check SUPABASE_URL and SUPABASE_ANON_KEY environment variables")
+    def normalize_capacity(self, capacity_mw: float, max_capacity: float = 4000.0) -> float:
+        """Normalize capacity to 0-100 scale"""
+        return min(100, (capacity_mw / max_capacity) * 100)
     
-    url = f"{SUPABASE_URL}/rest/v1/{table}"
-    headers = {
-        "apikey": SUPABASE_ANON_KEY,
-        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-        "Content-Type": "application/json"
-    }
+    def calculate_grid_proximity_score(self, site_data: dict) -> float:
+        """Calculate grid proximity score based on location"""
+        lat, lng = site_data['latitude'], site_data['longitude']
+        
+        # UK regional grid scoring
+        if 51.0 <= lat <= 52.0 and -1.0 <= lng <= 1.0:  # London/Southeast
+            return 90.0
+        elif lat >= 56.0:  # Scotland
+            return 70.0
+        elif lat <= 52.0 and lng <= -2.0:  # Wales/Southwest
+            return 75.0
+        else:  # Midlands/North
+            return 80.0
     
-    params = {"select": select} if select != "*" else {}
+    def calculate_planning_risk_score(self, site_data: dict) -> float:
+        """Calculate planning risk score"""
+        status = site_data.get('status', '').lower()
+        technology = site_data.get('technology', '').lower()
+        
+        if 'operational' in status:
+            base_score = 100.0
+        elif 'construction' in status:
+            base_score = 95.0
+        elif 'planning' in status:
+            base_score = 60.0
+        else:
+            base_score = 50.0
+        
+        # Technology adjustments
+        if 'solar' in technology:
+            base_score += 10.0
+        elif 'offshore' in technology:
+            base_score -= 10.0
+        
+        return min(100.0, max(0.0, base_score))
     
-    # Add filters if provided
-    if filters:
-        params.update(filters)
+    def calculate_market_demand_score(self, site_data: dict) -> float:
+        """Calculate market demand score"""
+        technology = site_data.get('technology', '').lower()
+        
+        if 'offshore wind' in technology:
+            return 95.0
+        elif 'battery' in technology:
+            return 90.0
+        elif 'solar' in technology:
+            return 85.0
+        elif 'onshore wind' in technology:
+            return 80.0
+        else:
+            return 75.0
     
-    try:
-        async with httpx.AsyncClient() as client:
-            logger.info(f"Fetching data from Supabase table: {table}")
-            response = await client.get(url, headers=headers, params=params)
-            response.raise_for_status()
-            data = response.json()
-            logger.info(f"Successfully retrieved {len(data)} records from {table}")
-            return data
-    except httpx.HTTPError as e:
-        logger.error(f"Supabase API error: {e}")
-        raise HTTPException(status_code=500, detail=f"Database connection failed: {str(e)}")
-    except Exception as e:
-        logger.error(f"Unexpected error accessing Supabase: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-# ==============================
-# AI Proxy Routes (UNCHANGED)
-# ==============================
-
-class ChatRequest(BaseModel):
-    prompt: str
-
-class ChatResponse(BaseModel):
-    response: str
-    model_used: str
-    status: str = "success"
-
-# Read API keys from environment variables (must be set in Render)
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-PERPLEXITY_API_KEY = os.environ.get("PERPLEXITY_API_KEY")
-
-# Configuration
-LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "60.0"))  # 60 seconds default
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
-
-async def call_openai_with_retry(prompt: str, max_retries: int = MAX_RETRIES) -> dict:
-    """Call OpenAI API with retry logic and proper error handling."""
-    
-    if not OPENAI_API_KEY:
-        raise HTTPException(status_code=500, detail="OpenAI API key not configured")
-    
-    for attempt in range(max_retries):
-        try:
-            timeout = httpx.Timeout(LLM_TIMEOUT)
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                logger.info(f"Calling OpenAI API (attempt {attempt + 1}/{max_retries})")
-                
-                response = await client.post(
-                    "https://api.openai.com/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {OPENAI_API_KEY}",
-                        "Content-Type": "application/json"
-                    },
-                    json={
-                        "model": "gpt-4o-mini",
-                        "messages": [{"role": "user", "content": prompt}],
-                        "max_tokens": 1000,
-                        "temperature": 0.7
-                    },
-                )
-                
-                if response.status_code == 200:
-                    result = response.json()
-                    return {
-                        "response": result["choices"][0]["message"]["content"],
-                        "model_used": "gpt-4o-mini",
-                        "status": "success"
-                    }
-                elif response.status_code == 429:  # Rate limit
-                    if attempt < max_retries - 1:
-                        delay = 2 ** attempt
-                        logger.warning(f"Rate limited, waiting {delay} seconds before retry")
-                        await asyncio.sleep(delay)
-                        continue
-                    else:
-                        raise HTTPException(status_code=429, detail="Rate limit exceeded")
-                else:
-                    error_detail = response.text
-                    logger.error(f"OpenAI API error: {response.status_code} - {error_detail}")
-                    raise HTTPException(
-                        status_code=response.status_code,
-                        detail=f"OpenAI API error: {error_detail}"
-                    )
-                    
-        except httpx.ReadTimeout:
-            if attempt == max_retries - 1:
-                raise HTTPException(
-                    status_code=504,
-                    detail="Request to OpenAI API timed out after all retry attempts"
-                )
-            else:
-                delay = 2 ** attempt
-                logger.warning(f"Request timed out, retrying in {delay} seconds")
-                await asyncio.sleep(delay)
+    def calculate_competition_score(self, site_data: dict, all_sites: list) -> float:
+        """Calculate competition score"""
+        lat, lng = site_data['latitude'], site_data['longitude']
+        technology = site_data.get('technology', '').lower()
+        
+        nearby_similar = 0
+        for other_site in all_sites:
+            if other_site['id'] == site_data['id']:
                 continue
                 
-        except httpx.RequestError as e:
-            if attempt == max_retries - 1:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Failed to connect to OpenAI API: {str(e)}"
-                )
-            else:
-                delay = 2 ** attempt
-                logger.warning(f"Connection error, retrying in {delay} seconds: {str(e)}")
-                await asyncio.sleep(delay)
-                continue
+            other_lat, other_lng = other_site['latitude'], other_site['longitude']
+            other_tech = other_site.get('technology', '').lower()
+            
+            # Simple proximity check (~50km)
+            if abs(lat - other_lat) < 0.5 and abs(lng - other_lng) < 0.5 and technology in other_tech:
+                nearby_similar += 1
+        
+        if nearby_similar == 0:
+            return 100.0
+        elif nearby_similar <= 2:
+            return 80.0
+        elif nearby_similar <= 4:
+            return 60.0
+        else:
+            return 40.0
     
-    raise HTTPException(status_code=500, detail="All retry attempts failed")
-
-async def call_perplexity_with_retry(prompt: str, max_retries: int = MAX_RETRIES) -> dict:
-    """Call Perplexity API with retry logic and proper error handling."""
+    def calculate_site_score(self, site_data: dict, all_sites: list) -> float:
+        """Calculate overall investment score"""
+        capacity_score = self.normalize_capacity(site_data['capacity_mw'])
+        grid_score = self.calculate_grid_proximity_score(site_data)
+        planning_score = self.calculate_planning_risk_score(site_data)
+        market_score = self.calculate_market_demand_score(site_data)
+        competition_score = self.calculate_competition_score(site_data, all_sites)
+        
+        total_score = (
+            capacity_score * self.config.capacity_weight +
+            grid_score * self.config.grid_proximity_weight +
+            planning_score * self.config.planning_risk_weight +
+            market_score * self.config.market_demand_weight +
+            competition_score * self.config.competition_weight
+        )
+        
+        return round(total_score, 1)
     
-    if not PERPLEXITY_API_KEY:
-        raise HTTPException(status_code=500, detail="Perplexity API key not configured")
+    def get_score_color(self, score: float) -> str:
+        """Get color for map visualization"""
+        if score >= 80:
+            return "#2E8B57"  # Green
+        elif score >= 60:
+            return "#FFD700"  # Gold
+        elif score >= 40:
+            return "#FF8C00"  # Orange
+        else:
+            return "#DC143C"  # Red
     
-    for attempt in range(max_retries):
-        try:
-            timeout = httpx.Timeout(LLM_TIMEOUT)
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                logger.info(f"Calling Perplexity API (attempt {attempt + 1}/{max_retries})")
-                
-                response = await client.post(
-                    "https://api.perplexity.ai/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
-                        "Content-Type": "application/json"
-                    },
-                    json={
-                        "model": "llama-3.1-sonar-small-128k-online",  # Updated model name
-                        "messages": [{"role": "user", "content": prompt}],
-                        "max_tokens": 1000,
-                        "temperature": 0.2,
-                        "stream": False
-                    },
-                )
-                
-                if response.status_code == 200:
-                    result = response.json()
-                    return {
-                        "response": result["choices"][0]["message"]["content"],
-                        "model_used": "llama-3.1-sonar-small-128k-online",
-                        "status": "success"
-                    }
-                elif response.status_code == 429:  # Rate limit
-                    if attempt < max_retries - 1:
-                        delay = 2 ** attempt * 2  # Longer delay for rate limits
-                        logger.warning(f"Rate limited, waiting {delay} seconds before retry")
-                        await asyncio.sleep(delay)
-                        continue
-                    else:
-                        raise HTTPException(status_code=429, detail="Rate limit exceeded")
-                else:
-                    error_detail = response.text
-                    logger.error(f"Perplexity API error: {response.status_code} - {error_detail}")
-                    raise HTTPException(
-                        status_code=response.status_code,
-                        detail=f"Perplexity API error: {error_detail}"
-                    )
-                    
-        except httpx.ReadTimeout:
-            if attempt == max_retries - 1:
-                raise HTTPException(
-                    status_code=504,
-                    detail="Request to Perplexity API timed out after all retry attempts"
-                )
-            else:
-                delay = 2 ** attempt
-                logger.warning(f"Request timed out, retrying in {delay} seconds")
-                await asyncio.sleep(delay)
-                continue
-                
-        except httpx.RequestError as e:
-            if attempt == max_retries - 1:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Failed to connect to Perplexity API: {str(e)}"
-                )
-            else:
-                delay = 2 ** attempt
-                logger.warning(f"Connection error, retrying in {delay} seconds: {str(e)}")
-                await asyncio.sleep(delay)
-                continue
-    
-    raise HTTPException(status_code=500, detail="All retry attempts failed")
+    def get_marker_size(self, capacity_mw: float) -> str:
+        """Get marker size for map"""
+        if capacity_mw >= 1000:
+            return "large"
+        elif capacity_mw >= 200:
+            return "medium"
+        else:
+            return "small"
 
-@app.post("/api/v1/chatgpt", response_model=ChatResponse)
-async def chatgpt_chat(req: ChatRequest):
-    """Proxy request to OpenAI ChatGPT API with improved error handling"""
-    try:
-        logger.info(f"Received ChatGPT request with prompt: {req.prompt[:100]}...")
-        result = await call_openai_with_retry(req.prompt)
-        logger.info("ChatGPT request completed successfully")
-        return result
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error in ChatGPT endpoint: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
-
-@app.post("/api/v1/perplexity", response_model=ChatResponse)
-async def perplexity_chat(req: ChatRequest):
-    """Proxy request to Perplexity API with improved error handling"""
-    try:
-        logger.info(f"Received Perplexity request with prompt: {req.prompt[:100]}...")
-        result = await call_perplexity_with_retry(req.prompt)
-        logger.info("Perplexity request completed successfully")
-        return result
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error in Perplexity endpoint: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
-
-# Debug endpoints (remove in production)
-@app.get("/debug/openai")
-async def debug_openai():
-    """Debug endpoint to check OpenAI configuration"""
-    return {
-        "api_key_present": bool(OPENAI_API_KEY),
-        "api_key_length": len(OPENAI_API_KEY) if OPENAI_API_KEY else 0,
-        "timeout_setting": LLM_TIMEOUT,
-        "max_retries": MAX_RETRIES
-    }
-
-@app.get("/debug/perplexity")
-async def debug_perplexity():
-    """Debug endpoint to check Perplexity configuration"""
-    return {
-        "api_key_present": bool(PERPLEXITY_API_KEY),
-        "api_key_length": len(PERPLEXITY_API_KEY) if PERPLEXITY_API_KEY else 0,
-        "timeout_setting": LLM_TIMEOUT,
-        "max_retries": MAX_RETRIES
-    }
-
-@app.get("/debug/supabase")
-async def debug_supabase():
-    """Debug endpoint to check Supabase configuration"""
-    return {
-        "supabase_url_present": bool(SUPABASE_URL),
-        "supabase_anon_key_present": bool(SUPABASE_ANON_KEY),
-        "supabase_url": SUPABASE_URL[:50] + "..." if SUPABASE_URL else None,
-        "configuration_complete": bool(SUPABASE_URL and SUPABASE_ANON_KEY)
-    }
-
-# ==============================
-# Renewable Sites API Routes (UPDATED TO USE SUPABASE REST API)
-# ==============================
-
-def convert_to_geojson(sites_data: List[Dict]) -> Dict:
-    """Convert renewable sites data to GeoJSON FeatureCollection format"""
+# REPLACE your existing convert_to_geojson function with this enhanced version
+def convert_to_geojson(sites_data: List[Dict], include_scores: bool = True) -> Dict:
+    """Convert renewable sites data to GeoJSON FeatureCollection format with scoring"""
+    scorer = SiteScorer(current_scoring_config) if include_scores else None
     features = []
     
     for site in sites_data:
-        # Handle potential None values and different field names
         lat = site.get('latitude')
         lng = site.get('longitude')
         
@@ -351,23 +154,43 @@ def convert_to_geojson(sites_data: List[Dict]) -> Dict:
             continue
             
         try:
+            # Calculate score if requested
+            investment_score = None
+            score_color = None
+            marker_size = None
+            
+            if scorer:
+                investment_score = scorer.calculate_site_score(site, sites_data)
+                score_color = scorer.get_score_color(investment_score)
+                marker_size = scorer.get_marker_size(site.get('capacity_mw', 0))
+            
             feature = {
                 "type": "Feature",
                 "geometry": {
                     "type": "Point",
-                    "coordinates": [float(lng), float(lat)]  # GeoJSON format: [longitude, latitude]
+                    "coordinates": [float(lng), float(lat)]
                 },
                 "properties": {
-                    "id": site.get('id'),
-                    "name": site.get('site_name'),  # Keep 'name' for compatibility with your existing frontend
-                    "site_name": site.get('site_name'),  # Also include original field name
+                    "site_id": site.get('id'),
+                    "name": site.get('site_name'),
                     "developer": site.get('developer'),
                     "technology": site.get('technology'),
                     "capacity_mw": float(site.get('capacity_mw', 0)),
-                    "status": site.get('status')
+                    "status": site.get('status'),
+                    "created_at": site.get('created_at')
                 }
             }
+            
+            # Add scoring data if available
+            if investment_score is not None:
+                feature["properties"].update({
+                    "investment_score": investment_score,
+                    "score_color": score_color,
+                    "marker_size": marker_size
+                })
+            
             features.append(feature)
+            
         except (ValueError, TypeError) as e:
             logger.warning(f"Error processing site {site.get('site_name', 'Unknown')}: {e}")
             continue
@@ -377,12 +200,11 @@ def convert_to_geojson(sites_data: List[Dict]) -> Dict:
         "features": features
     }
 
+# UPDATE your existing /api/sites endpoint to include scoring parameter
 @app.get("/api/sites")
-async def get_renewable_sites():
-    """Get all renewable energy sites as GeoJSON for map display"""
-    
+async def get_renewable_sites(include_scores: bool = True):
+    """Get all renewable energy sites as GeoJSON for map display with optional scoring"""
     try:
-        # Fetch data from Supabase using REST API
         sites_data = await get_supabase_data("renewable_sites")
         
         if not sites_data:
@@ -392,10 +214,10 @@ async def get_renewable_sites():
                 "features": []
             }
         
-        # Convert to GeoJSON format for map display (same format as before)
-        geojson = convert_to_geojson(sites_data)
+        # Convert to GeoJSON format with scoring
+        geojson = convert_to_geojson(sites_data, include_scores)
         
-        logger.info(f"Successfully converted {len(geojson['features'])} sites to GeoJSON")
+        logger.info(f"Successfully converted {len(geojson['features'])} sites to GeoJSON with scoring: {include_scores}")
         return geojson
         
     except HTTPException:
@@ -404,88 +226,205 @@ async def get_renewable_sites():
         logger.error(f"Unexpected error in get_renewable_sites: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch renewable sites: {str(e)}")
 
-@app.get("/api/sites/simple")
-async def get_sites_simple():
-    """Get renewable sites as simple JSON (for testing)"""
-    
-    try:
-        sites_data = await get_supabase_data("renewable_sites")
-        
-        logger.info(f"Successfully retrieved {len(sites_data)} sites in simple format")
-        return {"sites": sites_data, "count": len(sites_data)}
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error in get_sites_simple: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to fetch sites data: {str(e)}")
+# ADD THESE NEW ENDPOINTS after your existing endpoints
 
-# Additional useful endpoints
-@app.get("/api/sites/{site_id}")
-async def get_renewable_site(site_id: int):
-    """Get a specific renewable energy site by ID"""
+@app.get("/api/sites/filtered")
+async def get_filtered_sites(
+    technology: Optional[str] = None,
+    status: Optional[str] = None,
+    min_capacity: Optional[float] = None,
+    max_capacity: Optional[float] = None,
+    min_score: Optional[float] = None
+):
+    """Get filtered sites in GeoJSON format"""
     try:
         sites_data = await get_supabase_data("renewable_sites")
         
-        # Filter by site_id
+        # Apply filters
+        filtered_sites = sites_data
+        
+        if technology:
+            filtered_sites = [s for s in filtered_sites if technology.lower() in s['technology'].lower()]
+        
+        if status:
+            filtered_sites = [s for s in filtered_sites if status.lower() in s['status'].lower()]
+        
+        if min_capacity:
+            filtered_sites = [s for s in filtered_sites if s['capacity_mw'] >= min_capacity]
+        
+        if max_capacity:
+            filtered_sites = [s for s in filtered_sites if s['capacity_mw'] <= max_capacity]
+        
+        # Convert to GeoJSON with scores
+        geojson = convert_to_geojson(filtered_sites, include_scores=True)
+        
+        # Apply score filter after scoring
+        if min_score:
+            geojson['features'] = [
+                f for f in geojson['features'] 
+                if f['properties'].get('investment_score', 0) >= min_score
+            ]
+        
+        return geojson
+        
+    except Exception as e:
+        logger.error(f"Error filtering sites: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to filter sites: {str(e)}")
+
+@app.get("/api/sites/{site_id}/details")
+async def get_site_details(site_id: int):
+    """Get detailed site information with scoring breakdown"""
+    try:
+        sites_data = await get_supabase_data("renewable_sites")
         site = next((s for s in sites_data if s.get('id') == site_id), None)
         
         if not site:
             raise HTTPException(status_code=404, detail="Site not found")
-            
-        return site
+        
+        # Calculate detailed scoring
+        scorer = SiteScorer(current_scoring_config)
+        overall_score = scorer.calculate_site_score(site, sites_data)
+        
+        score_breakdown = {
+            "capacity_score": scorer.normalize_capacity(site['capacity_mw']),
+            "grid_proximity_score": scorer.calculate_grid_proximity_score(site),
+            "planning_risk_score": scorer.calculate_planning_risk_score(site),
+            "market_demand_score": scorer.calculate_market_demand_score(site),
+            "competition_score": scorer.calculate_competition_score(site, sites_data),
+            "overall_score": overall_score
+        }
+        
+        return {
+            "site": site,
+            "scoring": score_breakdown,
+            "investment_recommendation": "Strong" if overall_score >= 80 else "Moderate" if overall_score >= 60 else "Cautious"
+        }
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error fetching site {site_id}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to fetch site data")
+        logger.error(f"Error getting site details: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get site details: {str(e)}")
 
-@app.get("/api/sites/stats")
-async def get_renewable_sites_stats():
-    """Get statistics about renewable energy sites"""
+# ADMIN ENDPOINTS - add these new endpoints
+
+@app.get("/admin/scoring-config")
+async def get_scoring_config():
+    """Get current scoring configuration"""
+    return current_scoring_config
+
+@app.put("/admin/scoring-config")
+async def update_scoring_config(config: ScoringConfig):
+    """Update scoring weights"""
+    global current_scoring_config
+    
+    # Validate weights
+    total_weight = (config.capacity_weight + config.grid_proximity_weight + 
+                   config.planning_risk_weight + config.market_demand_weight + 
+                   config.competition_weight)
+    
+    if not 0.8 <= total_weight <= 1.2:
+        raise HTTPException(status_code=400, detail="Weights should sum to approximately 1.0")
+    
+    current_scoring_config = config
+    logger.info(f"Updated scoring configuration: {config}")
+    
+    return {"message": "Scoring configuration updated", "config": config}
+
+@app.post("/admin/upload-sites-data")
+async def upload_sites_data(file: UploadFile = File(...)):
+    """Upload CSV file to update sites data"""
+    if not file.filename.endswith('.csv'):
+        raise HTTPException(status_code=400, detail="File must be CSV format")
+    
     try:
-        sites_data = await get_supabase_data("renewable_sites")
+        content = await file.read()
+        csv_data = content.decode('utf-8')
         
-        if not sites_data:
-            return {
-                "total_sites": 0,
-                "total_capacity_mw": 0,
-                "technology_breakdown": {},
-                "status_breakdown": {}
-            }
+        # Parse CSV
+        df = pd.read_csv(io.StringIO(csv_data))
         
-        total_sites = len(sites_data)
-        total_capacity = sum(site.get('capacity_mw', 0) for site in sites_data if site.get('capacity_mw'))
+        # Validate required columns
+        required_columns = ['site_name', 'developer', 'technology', 'capacity_mw', 'latitude', 'longitude', 'status']
+        missing_columns = [col for col in required_columns if col not in df.columns]
         
-        # Group by technology
-        tech_stats = {}
-        for site in sites_data:
-            tech = site.get('technology', 'Unknown')
-            if tech not in tech_stats:
-                tech_stats[tech] = {"count": 0, "total_capacity_mw": 0}
-            tech_stats[tech]["count"] += 1
-            tech_stats[tech]["total_capacity_mw"] += site.get('capacity_mw', 0)
+        if missing_columns:
+            raise HTTPException(status_code=400, detail=f"Missing required columns: {missing_columns}")
         
-        # Group by status
-        status_stats = {}
-        for site in sites_data:
-            status = site.get('status', 'Unknown')
-            status_stats[status] = status_stats.get(status, 0) + 1
+        # Clean data
+        df = df.dropna(subset=required_columns)
+        sites_data = df.to_dict('records')
+        
+        # TODO: In production, you'd update Supabase here
+        # For now, just validate and return preview
+        logger.info(f"CSV upload validated: {len(sites_data)} sites")
         
         return {
-            "total_sites": total_sites,
-            "total_capacity_mw": total_capacity,
-            "technology_breakdown": tech_stats,
-            "status_breakdown": status_stats
+            "message": f"CSV validated successfully with {len(sites_data)} sites",
+            "preview": sites_data[:3] if sites_data else [],
+            "note": "To persist data, implement Supabase update logic"
         }
         
     except Exception as e:
-        logger.error(f"Error calculating stats: {e}")
-        raise HTTPException(status_code=500, detail="Failed to calculate statistics")
+        logger.error(f"Error processing CSV: {e}")
+        raise HTTPException(status_code=500, detail=f"Error processing CSV: {str(e)}")
 
-# ==============================
-# Run app (only in local dev)
-# ==============================
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=settings.API_PORT)
+@app.get("/admin/demo-data")
+async def get_demo_data():
+    """Get complete demo dataset for investor presentations"""
+    try:
+        sites_data = await get_supabase_data("renewable_sites")
+        
+        # Get scored GeoJSON
+        geojson = convert_to_geojson(sites_data, include_scores=True)
+        
+        # Calculate summary stats
+        scores = [f['properties']['investment_score'] for f in geojson['features'] if f['properties'].get('investment_score')]
+        
+        summary_stats = {
+            "total_sites": len(sites_data),
+            "total_capacity_mw": sum(s['capacity_mw'] for s in sites_data),
+            "average_investment_score": round(sum(scores) / len(scores), 1) if scores else 0,
+            "high_opportunity_sites": len([s for s in scores if s >= 80]),
+            "technologies": list(set(s['technology'] for s in sites_data)),
+            "status_breakdown": {
+                "operational": len([s for s in sites_data if 'operational' in s.get('status', '').lower()]),
+                "construction": len([s for s in sites_data if 'construction' in s.get('status', '').lower()]),
+                "planning": len([s for s in sites_data if 'planning' in s.get('status', '').lower()])
+            }
+        }
+        
+        return {
+            "geojson": geojson,
+            "summary": summary_stats,
+            "current_weights": current_scoring_config
+        }
+        
+    except Exception as e:
+        logger.error(f"Error generating demo data: {e}")
+        raise HTTPException(status_code=500, detail=f"Error generating demo data: {str(e)}")
+
+@app.post("/admin/recalculate-scores")
+async def recalculate_all_scores():
+    """Recalculate scores for all sites with current weights"""
+    try:
+        sites_data = await get_supabase_data("renewable_sites")
+        scorer = SiteScorer(current_scoring_config)
+        
+        scores = []
+        for site in sites_data:
+            score = scorer.calculate_site_score(site, sites_data)
+            scores.append(score)
+        
+        avg_score = sum(scores) / len(scores) if scores else 0
+        
+        return {
+            "message": f"Recalculated scores for {len(sites_data)} sites",
+            "average_score": round(avg_score, 1),
+            "high_scoring_sites": len([s for s in scores if s >= 80]),
+            "current_weights": current_scoring_config
+        }
+        
+    except Exception as e:
+        logger.error(f"Error recalculating scores: {e}")
+        raise HTTPException(status_code=500, detail=f"Error recalculating scores: {str(e)}")
