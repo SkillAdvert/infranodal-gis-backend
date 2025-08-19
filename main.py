@@ -9,6 +9,9 @@ import os
 import logging
 import asyncio
 from typing import Optional
+import psycopg2
+import psycopg2.extras
+from typing import List, Dict, Any
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -47,6 +50,7 @@ async def environment_check():
     env_vars = {
         "OPENAI_API_KEY": "✅" if os.getenv("OPENAI_API_KEY") else "❌",
         "PERPLEXITY_API_KEY": "✅" if os.getenv("PERPLEXITY_API_KEY") else "❌",
+        "DATABASE_URL": "✅" if os.getenv("DATABASE_URL") else "❌",
     }
     
     return {
@@ -273,6 +277,87 @@ async def debug_perplexity():
         "timeout_setting": LLM_TIMEOUT,
         "max_retries": MAX_RETRIES
     }
+
+# ==============================
+# Renewable Sites API Routes  
+# ==============================
+
+@app.get("/api/sites")
+async def get_renewable_sites():
+    """Get all renewable energy sites as GeoJSON for map display"""
+    
+    try:
+        # Connect to Supabase database
+        conn = psycopg2.connect(settings.DATABASE_URL)
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        # Get all sites
+        cur.execute("""
+            SELECT 
+                id,
+                site_name,
+                developer,
+                technology,
+                capacity_mw,
+                latitude,
+                longitude,
+                status
+            FROM renewable_sites 
+            ORDER BY capacity_mw DESC
+        """)
+        
+        sites = cur.fetchall()
+        
+        # Convert to GeoJSON format for map display
+        geojson = {
+            "type": "FeatureCollection",
+            "features": []
+        }
+        
+        for site in sites:
+            feature = {
+                "type": "Feature",
+                "geometry": {
+                    "type": "Point",
+                    "coordinates": [float(site['longitude']), float(site['latitude'])]
+                },
+                "properties": {
+                    "id": site['id'],
+                    "name": site['site_name'],
+                    "developer": site['developer'],
+                    "technology": site['technology'],
+                    "capacity_mw": float(site['capacity_mw']),
+                    "status": site['status']
+                }
+            }
+            geojson["features"].append(feature)
+        
+        cur.close()
+        conn.close()
+        
+        return geojson
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+@app.get("/api/sites/simple")
+async def get_sites_simple():
+    """Get renewable sites as simple JSON (for testing)"""
+    
+    try:
+        conn = psycopg2.connect(settings.DATABASE_URL)
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        cur.execute("SELECT * FROM renewable_sites ORDER BY capacity_mw DESC")
+        sites = cur.fetchall()
+        
+        cur.close()
+        conn.close()
+        
+        return {"sites": sites, "count": len(sites)}
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 # ==============================
 # Run app (only in local dev)
