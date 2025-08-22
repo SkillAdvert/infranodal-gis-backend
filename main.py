@@ -2,6 +2,8 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from pydantic import BaseModel
 import pandas as pd
+from typing import Optional, List, Dict, Any
+
 import io
 
 # ADD THESE MODELS after your existing ChatRequest/ChatResponse models
@@ -428,3 +430,4 @@ async def recalculate_all_scores():
     except Exception as e:
         logger.error(f"Error recalculating scores: {e}")
         raise HTTPException(status_code=500, detail=f"Error recalculating scores: {str(e)}")
+
